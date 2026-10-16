@@ -20,9 +20,18 @@ printf '%s 07:00 19:00\n' "$(date +%F)" >"$HOME/.cache/circadian/sun"
 set_night() { export CIRCADIAN_NOW=$(date -d "$(date +%F) 03:00" +%s); }
 set_day() { export CIRCADIAN_NOW=$(date -d "$(date +%F) 12:00" +%s); }
 
+# Like the real one: stages the theme at current/theme and, unless told to
+# leave the wallpaper alone, steps the background link to the next one.
 cat >"$T/bin/omarchy-theme-set" <<EOF
 #!/bin/bash
-echo "\$1" >"$HOME/.local/state/omarchy/current/theme.name"
+cur=$HOME/.local/state/omarchy/current
+rm -rf "\$cur/theme"; mkdir -p "\$cur/theme"
+cp -r "$HOME/.config/omarchy/themes/\$1/." "\$cur/theme/"
+echo "\$1" >"\$cur/theme.name"
+[[ \${OMARCHY_THEME_SKIP_BACKGROUND:-} == 1 ]] && exit 0
+[[ -d \$cur/theme/backgrounds ]] || exit 0
+next=\$(ls "\$cur/theme/backgrounds" | grep -A1 -xF "\$(basename "\$(readlink "\$cur/background")")" | sed -n 2p)
+ln -nsf "\$cur/theme/backgrounds/\${next:-\$(ls "\$cur/theme/backgrounds" | head -n1)}" "\$cur/background"
 EOF
 cat >"$T/bin/omarchy-theme-dir" <<EOF
 #!/bin/bash
@@ -46,7 +55,11 @@ cat >"$T/bin/setsid" <<EOF
 #!/bin/bash
 touch $T/sim/running; echo 6500 >$T/sim/temp
 EOF
-printf '#!/bin/bash\nexit 0\n' >"$T/bin/omarchy-shell"
+cat >"$T/bin/omarchy-shell" <<EOF
+#!/bin/bash
+[[ \$1 == background ]] && echo "\$*" >>"$T/sim/shell.log"
+exit 0
+EOF
 chmod +x "$T"/bin/*
 export PATH="$T/bin:$PATH"
 
@@ -142,6 +155,32 @@ mkdir -p "$HOME/.config/omarchy/themes/gruvbox"
 eq "new dark theme shown" "$(theme)" gruvbox
 "$engine" set darkTheme nope 2>/dev/null
 check "unknown theme rejected" .darkTheme gruvbox
+
+# Switching between the pair keeps the wallpaper of the same name.
+for t in rams rams-dark; do
+  mkdir -p "$HOME/.config/omarchy/themes/$t/backgrounds"
+  echo "mode" >"$HOME/.config/omarchy/themes/$t/colors.toml"
+  for b in 0-clock 1-grille 2-keys; do echo "$t $b" >"$HOME/.config/omarchy/themes/$t/backgrounds/$b.png"; done
+done
+"$engine" set lightTheme rams
+"$engine" set darkTheme rams-dark
+set_day
+omarchy-theme-set rams
+cur=$HOME/.local/state/omarchy/current
+ln -nsf "$cur/theme/backgrounds/0-clock.png" "$cur/background"
+"$engine" appearance dark
+eq "dark side shown" "$(theme)" rams-dark
+eq "wallpaper kept" "$(readlink "$cur/background")" "$cur/theme/backgrounds/0-clock.png"
+eq "wallpaper is the dark one" "$(cat "$cur/background")" "rams-dark 0-clock"
+eq "shell reveals the dark wallpaper" "$(tail -n1 "$T/sim/shell.log" | cut -d' ' -f4)" "$HOME/.config/omarchy/themes/rams-dark/backgrounds/0-clock.png"
+ln -nsf "$cur/theme/backgrounds/2-keys.png" "$cur/background"
+"$engine" appearance light
+eq "last wallpaper kept" "$(cat "$cur/background")" "rams 2-keys"
+# A wallpaper from outside the theme is left to omarchy-theme-set.
+echo pic >"$T/pic.png"
+ln -nsf "$T/pic.png" "$cur/background"
+"$engine" appearance dark
+eq "outside wallpaper: theme picks" "$(cat "$cur/background")" "rams-dark 0-clock"
 
 # Offline with no cache: fallback times.
 rm -f "$HOME/.cache/circadian/sun"

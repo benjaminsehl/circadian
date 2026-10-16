@@ -250,7 +250,72 @@ show_appearance() {
   [[ -n $theme ]] || return 0
   echo "$theme" >"$STATE_DIR/applied.theme"
   [[ $(current_theme) == "$theme" ]] && return 0
-  omarchy-theme-set "$theme" >/dev/null 2>&1
+  keep_background "$theme" || omarchy-theme-set "$theme" >/dev/null 2>&1
+}
+
+# --- wallpaper ----------------------------------------------------------------
+#
+# Switching between the pair keeps the wallpaper: rams/0-clock.png becomes
+# rams-dark/0-clock.png. omarchy-theme-set would step to the *next* wallpaper
+# instead, because both variants are staged at the same path under the same
+# names, so the switch looks like setting the same theme again.
+
+OMARCHY_CURRENT="$HOME/.local/state/omarchy/current"
+BACKGROUND_LINK="$OMARCHY_CURRENT/background"
+
+theme_file() {
+  local dir
+  for dir in "$HOME/.config/omarchy/themes/$1" "${OMARCHY_PATH:-/usr/share/omarchy}/themes/$1"; do
+    [[ -e $dir/$2 ]] && { echo "$dir/$2"; return 0; }
+  done
+  return 1
+}
+
+# Sets BG_LINK (where the background link should point once $1 is current)
+# and BG_FILE (the image itself, readable now) for wallpaper $2 of theme $1.
+find_background() {
+  local theme=$1 name=$2
+  if [[ -f $HOME/.config/omarchy/backgrounds/$theme/$name ]]; then
+    BG_LINK=$HOME/.config/omarchy/backgrounds/$theme/$name
+    BG_FILE=$BG_LINK
+  else
+    BG_FILE=$(theme_file "$theme" "backgrounds/$name") || return 1
+    [[ -f $BG_FILE ]] || return 1
+    BG_LINK=$OMARCHY_CURRENT/theme/backgrounds/$name
+  fi
+  BG_FILE=$(readlink -f "$BG_FILE")
+}
+
+# Switches to theme $1 keeping the wallpaper of the same name, with the same
+# reveal omarchy-theme-set uses. Fails (and does nothing) when the wallpaper
+# isn't one of the current theme's or $1 has none by that name.
+keep_background() {
+  local theme=$1 link name old snap colors shell_toml
+  link=$(readlink "$BACKGROUND_LINK" 2>/dev/null) || return 1
+  case $link in
+    "$OMARCHY_CURRENT/theme/backgrounds/"* | "$HOME/.config/omarchy/backgrounds/$(current_theme)/"*) ;;
+    *) return 1 ;;
+  esac
+  name=${link##*/}
+  find_background "$theme" "$name" || return 1
+  [[ -f $(theme_file "$theme" colors.toml) ]] || return 1
+
+  # The old image is replaced when the theme is swapped in; the reveal needs a copy.
+  old=$(readlink -f "$BACKGROUND_LINK")
+  snap="$CACHE_DIR/background-$$.${name##*.}"
+  ln -f "$old" "$snap" 2>/dev/null || cp -f "$old" "$snap" 2>/dev/null || snap=""
+
+  colors=$(base64 -w 0 "$(theme_file "$theme" colors.toml)")
+  shell_toml=$(theme_file "$theme" shell.toml) && shell_toml=$(base64 -w 0 "$shell_toml") || shell_toml=""
+
+  if ! timeout 2 omarchy-shell background themeTransition "$snap" "$BG_FILE" "$BG_FILE" "$colors" "$shell_toml" >/dev/null 2>&1; then
+    rm -f "$snap"
+    return 1
+  fi
+  OMARCHY_THEME_SKIP_BACKGROUND=1 omarchy-theme-set "$theme" >/dev/null 2>&1
+  ln -nsf "$BG_LINK" "$BACKGROUND_LINK"
+  [[ -n $snap ]] && { (sleep 3; rm -f "$snap") 8>&- >/dev/null 2>&1 & }
+  return 0
 }
 
 # --- night shift ------------------------------------------------------------
