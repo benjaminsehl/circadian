@@ -1,0 +1,471 @@
+#!/bin/bash
+# circadian: your desktop follows the day.
+#
+# Pairs a light and a dark Omarchy theme and a Night Shift (hyprsunset blue
+# light filter) with sunrise and sunset.
+#
+#   circadian                          status
+#   circadian appearance light|dark|toggle
+#   circadian nightshift on|off|toggle
+#   circadian set lightTheme <slug>    theme used by day
+#   circadian set darkTheme <slug>     theme used by night
+#   circadian set darkAtNight on|off   switch appearance at sunset/sunrise
+#   circadian set nightShiftAtNight on|off
+#   circadian set warmth <kelvin>      Night Shift colour temperature (2500-5500)
+#   circadian apply                    catch up with the sun (run periodically)
+#   circadian status --json
+#   circadian themes --json            installed themes and their light/dark mode
+#
+# With a schedule on, a manual change holds until the next sunrise or sunset,
+# then the sun takes over again. With it off, a change stays put.
+#
+# Appearance only acts while one of the two assigned themes is showing, so
+# picking any other theme is left alone. Picking one of the pair in Omarchy's
+# theme switcher, or toggling Omarchy's night light, counts as a manual change.
+
+set -uo pipefail
+
+SELF=$(readlink -f "${BASH_SOURCE[0]}")
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/circadian"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/circadian"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/circadian"
+CONFIG="$CONFIG_DIR/config.json"
+SUN_FILE="$CACHE_DIR/sun"
+SUN_FAIL_FILE="$CACHE_DIR/sun.failed"
+CURRENT_NAME_FILE="$HOME/.local/state/omarchy/current/theme.name"
+
+FALLBACK_SUNRISE="07:00"
+FALLBACK_SUNSET="19:00"
+DAY_TEMP=6500
+NIGHT_SHIFT_BELOW=6000 # same threshold as Omarchy's night light
+MIN_WARMTH=2500
+MAX_WARMTH=5500
+
+mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$CACHE_DIR"
+
+# One writer at a time.
+exec 8>"$STATE_DIR/lock"
+flock 8
+
+# The clock; tests pin it with CIRCADIAN_NOW (epoch seconds).
+now() { echo "${CIRCADIAN_NOW:-$(date +%s)}"; }
+
+read_file() { [[ -s $1 ]] && head -n1 "$1" || echo "${2:-}"; }
+theme_label() { sed -E 's/(^|-)([a-z])/\1\u\2/g; s/-/ /g' <<<"$1"; }
+
+# --- config -----------------------------------------------------------------
+
+theme_mode() {
+  local dir
+  dir=$(omarchy-theme-dir "$1" 2>/dev/null) || return 1
+  [[ -f $dir/colors.toml ]] || return 1
+  omarchy-theme-color --file "$dir/colors.toml" mode 2>/dev/null
+}
+
+theme_exists() { [[ -d $HOME/.config/omarchy/themes/$1 || -d ${OMARCHY_PATH:-/usr/share/omarchy}/themes/$1 ]]; }
+
+# First run: pair the current theme with an obvious sibling when there is one
+# (tokyo-night has none; catppuccin/catppuccin-latte and x/x-light do).
+seed_config() {
+  local current mode light="" dark="" base candidate
+  current=$(read_file "$CURRENT_NAME_FILE")
+  mode=$(theme_mode "$current")
+
+  if [[ $mode == light ]]; then
+    light=$current
+    base=${current%-light}
+    base=${base%-latte}
+    [[ $base != "$current" ]] && theme_exists "$base" && dark=$base
+  elif [[ -n $current ]]; then
+    dark=$current
+    for candidate in "$current-light" "$current-latte"; do
+      theme_exists "$candidate" && { light=$candidate; break; }
+    done
+  fi
+
+  jq -n --arg light "$light" --arg dark "$dark" \
+    '{lightTheme:$light, darkTheme:$dark, darkAtNight:true, nightShiftAtNight:true, warmth:4000}' >"$CONFIG"
+}
+
+[[ -s $CONFIG ]] || seed_config
+
+cfg() { jq -r --arg k "$1" '.[$k] // empty | tostring' "$CONFIG" 2>/dev/null; }
+cfg_on() { [[ $(cfg "$1") == true ]]; }
+
+cfg_set() {
+  local key=$1 value=$2 tmp
+  tmp=$(mktemp "$CONFIG.XXXXXX")
+  jq --arg k "$key" --argjson v "$value" '.[$k] = $v' "$CONFIG" >"$tmp" && mv "$tmp" "$CONFIG"
+}
+
+warmth() {
+  local k
+  k=$(cfg warmth)
+  [[ $k =~ ^[0-9]+$ ]] || k=4000
+  ((k < MIN_WARMTH)) && k=$MIN_WARMTH
+  ((k > MAX_WARMTH)) && k=$MAX_WARMTH
+  echo "$k"
+}
+
+# --- the sun ----------------------------------------------------------------
+
+to_24h() { date -d "today $1" +%H:%M 2>/dev/null; }
+
+fetch_sun_times() {
+  local query="" location data sunrise sunset
+
+  # Same location as Omarchy's weather widget; empty = wttr.in IP lookup.
+  if [[ -s $HOME/.local/state/omarchy/settings/weather.json ]] && command -v omarchy-weather-location >/dev/null; then
+    location=$(omarchy-weather-location 2>/dev/null)
+    [[ -n $location ]] && query=$(jq -rn --arg l "$location" '$l | @uri')
+  fi
+
+  data=$(curl -fsS --max-time 5 "https://wttr.in/${query}?format=j1" 2>/dev/null |
+    jq -er '.weather[0].astronomy[0] | [.sunrise, .sunset] | @tsv' 2>/dev/null) || return 1
+
+  IFS=$'\t' read -r sunrise sunset <<<"$data"
+  sunrise=$(to_24h "$sunrise") && sunset=$(to_24h "$sunset") || return 1
+  [[ $sunrise =~ ^[0-9]{2}:[0-9]{2}$ && $sunset =~ ^[0-9]{2}:[0-9]{2}$ ]] || return 1
+
+  printf '%s %s %s\n' "$(date -d "@$(now)" +%F)" "$sunrise" "$sunset" >"$SUN_FILE"
+}
+
+# Sets SUNRISE, SUNSET, SUN_SOURCE (live | cached | fallback). Looks up once a
+# day, backing off 30 minutes after a failure (offline, wttr.in down).
+load_sun_times() {
+  local d="" r="" s="" last_fail
+
+  [[ -s $SUN_FILE ]] && read -r d r s <"$SUN_FILE"
+
+  if [[ $d != "$(date -d "@$(now)" +%F)" ]]; then
+    last_fail=$(read_file "$SUN_FAIL_FILE" 0)
+    if (($(now) - last_fail > 1800)); then
+      if fetch_sun_times; then
+        rm -f "$SUN_FAIL_FILE"
+        read -r d r s <"$SUN_FILE"
+      else
+        now >"$SUN_FAIL_FILE"
+      fi
+    fi
+  fi
+
+  if [[ -n $r && -n $s ]]; then
+    SUNRISE=$r SUNSET=$s
+    [[ $d == "$(date -d "@$(now)" +%F)" ]] && SUN_SOURCE=live || SUN_SOURCE=cached
+  else
+    SUNRISE=$FALLBACK_SUNRISE SUNSET=$FALLBACK_SUNSET SUN_SOURCE=fallback
+  fi
+}
+
+# The next sun event after a moment: EVENT_AT, EVENT_NAME (sunrise|sunset).
+# Today's times stand in for tomorrow's, which is close enough to switch by.
+next_event_after() {
+  local t=$1 day rise set
+  [[ -n ${SUNRISE:-} ]] || load_sun_times
+  day=$(date -d "@$t" +%F)
+  rise=$(date -d "$day $SUNRISE" +%s)
+  set=$(date -d "$day $SUNSET" +%s)
+
+  if ((t < rise)); then
+    EVENT_AT=$rise EVENT_NAME=sunrise
+  elif ((t < set)); then
+    EVENT_AT=$set EVENT_NAME=sunset
+  else
+    EVENT_AT=$(date -d "$(date -d "$day + 1 day" +%F) $SUNRISE" +%s) EVENT_NAME=sunrise
+  fi
+}
+
+is_night() { next_event_after "$(now)"; [[ $EVENT_NAME == sunrise ]]; }
+
+# --- features ---------------------------------------------------------------
+#
+# Two features share one model: appearance (light | dark) and nightshift
+# (on | off). Each has a night value, a schedule switch, an override that
+# lasts until the next sun event, and a manual value for when its schedule is
+# off.
+
+night_value() { [[ $1 == appearance ]] && echo dark || echo on; }
+day_value() { [[ $1 == appearance ]] && echo light || echo off; }
+schedule_key() { [[ $1 == appearance ]] && echo darkAtNight || echo nightShiftAtNight; }
+scheduled() { cfg_on "$(schedule_key "$1")"; }
+sun_value() { is_night && night_value "$1" || day_value "$1"; }
+flip_value() { [[ $2 == "$(night_value "$1")" ]] && day_value "$1" || night_value "$1"; }
+
+target() {
+  local f=$1 value until
+  if ! scheduled "$f"; then
+    read_file "$STATE_DIR/$f.manual" "$(observed "$f")"
+    return
+  fi
+  if [[ -s $STATE_DIR/$f.override ]]; then
+    read -r value until <"$STATE_DIR/$f.override"
+    if (($(now) < until)); then
+      echo "$value"
+      return
+    fi
+    rm -f "$STATE_DIR/$f.override"
+  fi
+  sun_value "$f"
+}
+
+# A manual change. With the schedule on it lasts until the next sun event; a
+# change that agrees with the sun is no override at all.
+choose() {
+  local f=$1 value=$2
+  if scheduled "$f"; then
+    if [[ $value == "$(sun_value "$f")" ]]; then
+      rm -f "$STATE_DIR/$f.override"
+    else
+      next_event_after "$(now)"
+      echo "$value $EVENT_AT" >"$STATE_DIR/$f.override"
+    fi
+  else
+    echo "$value" >"$STATE_DIR/$f.manual"
+  fi
+}
+
+has_override() { [[ -s $STATE_DIR/$1.override ]]; }
+
+# --- appearance -------------------------------------------------------------
+
+current_theme() { read_file "$CURRENT_NAME_FILE"; }
+
+# light | dark | other
+observed_appearance() {
+  local theme
+  theme=$(current_theme)
+  if [[ -n $theme && $theme == "$(cfg lightTheme)" ]]; then
+    echo light
+  elif [[ -n $theme && $theme == "$(cfg darkTheme)" ]]; then
+    echo dark
+  else
+    echo other
+  fi
+}
+
+show_appearance() {
+  local value=$1 theme
+  [[ $value == light ]] && theme=$(cfg lightTheme) || theme=$(cfg darkTheme)
+  [[ -n $theme ]] || return 0
+  echo "$theme" >"$STATE_DIR/applied.theme"
+  [[ $(current_theme) == "$theme" ]] && return 0
+  omarchy-theme-set "$theme" >/dev/null 2>&1
+}
+
+# --- night shift ------------------------------------------------------------
+
+hyprsunset_running() { pgrep -x hyprsunset >/dev/null; }
+
+current_temp() {
+  hyprsunset_running || return 1
+  hyprctl hyprsunset temperature 2>/dev/null | grep -oE '[0-9]+' | head -n1
+}
+
+observed_nightshift() {
+  local t
+  t=$(current_temp) && [[ -n $t ]] && ((t < NIGHT_SHIFT_BELOW)) && echo on || echo off
+}
+
+set_temp() {
+  local temp=$1
+  if ! hyprsunset_running; then
+    ((temp >= NIGHT_SHIFT_BELOW)) && return 0 # nothing to undo
+    setsid uwsm-app -- hyprsunset >/dev/null 2>&1 &
+  fi
+  # A fresh hyprsunset applies its own default at the end of startup, so
+  # resend until it sticks (as omarchy-toggle-nightlight does).
+  for _ in {1..10}; do
+    hyprctl hyprsunset temperature "$temp" >/dev/null 2>&1
+    [[ $(current_temp) == "$temp" ]] && break
+    sleep 0.2
+  done
+  omarchy-shell -q nightlight refresh >/dev/null 2>&1 || true
+}
+
+show_nightshift() {
+  local value=$1 want current
+  [[ $value == on ]] && want=$(warmth) || want=$DAY_TEMP
+  echo "$value" >"$STATE_DIR/applied.nightshift"
+  current=$(current_temp) || current=$DAY_TEMP
+  [[ $current == "$want" ]] && return 0
+  [[ $value == off ]] && ((current >= NIGHT_SHIFT_BELOW)) && return 0
+  set_temp "$want"
+}
+
+# --- shared -----------------------------------------------------------------
+
+observed() { [[ $1 == appearance ]] && observed_appearance || observed_nightshift; }
+show() { [[ $1 == appearance ]] && show_appearance "$2" || show_nightshift "$2"; }
+
+# Changes made outside Circadian (theme switcher, omarchy toggle nightlight,
+# its keybinding) count as manual choices.
+adopt_external_changes() {
+  local now applied
+  now=$(observed_appearance)
+  applied=$(read_file "$STATE_DIR/applied.theme")
+  if [[ $now != other && -n $applied && $(current_theme) != "$applied" ]]; then
+    choose appearance "$now"
+    current_theme >"$STATE_DIR/applied.theme"
+  fi
+
+  now=$(observed_nightshift)
+  applied=$(read_file "$STATE_DIR/applied.nightshift")
+  if [[ -n $applied && $now != "$applied" ]]; then
+    choose nightshift "$now"
+    echo "$now" >"$STATE_DIR/applied.nightshift"
+  fi
+}
+
+apply() {
+  adopt_external_changes
+  [[ $(observed_appearance) != other ]] && show appearance "$(target appearance)"
+  show nightshift "$(target nightshift)"
+}
+
+set_feature() {
+  local f=$1 value=$2
+  [[ $value == toggle ]] && value=$(flip_value "$f" "$(observed "$f")")
+  case $f:$value in
+    appearance:light | appearance:dark | nightshift:on | nightshift:off) ;;
+    *) echo "circadian: $f takes $(day_value "$f")|$(night_value "$f")|toggle" >&2; return 1 ;;
+  esac
+  adopt_external_changes
+  choose "$f" "$value"
+  show "$f" "$value"
+}
+
+set_schedule() {
+  local f=$1 on=$2
+  if [[ $on == true ]]; then
+    cfg_set "$(schedule_key "$f")" true
+    rm -f "$STATE_DIR/$f.override"
+    [[ $f == nightshift || $(observed_appearance) != other ]] && show "$f" "$(target "$f")"
+  else
+    # Keep what's showing; it just stops changing by itself.
+    scheduled "$f" && observed "$f" >"$STATE_DIR/$f.manual"
+    cfg_set "$(schedule_key "$f")" false
+    rm -f "$STATE_DIR/$f.override"
+  fi
+}
+
+set_option() {
+  local key=$1 value=${2:-} was
+  case $key in
+    lightTheme | darkTheme)
+      theme_exists "$value" || { echo "circadian: no theme '$value'" >&2; return 1; }
+      was=$(observed_appearance)
+      cfg_set "$key" "$(jq -n --arg v "$value" '$v')"
+      # Swapping the theme for the side that's showing switches to it now.
+      [[ $key == lightTheme && $was == light ]] && show appearance light
+      [[ $key == darkTheme && $was == dark ]] && show appearance dark
+      ;;
+    darkAtNight | nightShiftAtNight)
+      case $value in on | true) value=true ;; off | false) value=false ;; *) echo "circadian: $key takes on|off" >&2; return 1 ;; esac
+      [[ $key == darkAtNight ]] && set_schedule appearance "$value" || set_schedule nightshift "$value"
+      ;;
+    warmth)
+      [[ $value =~ ^[0-9]+$ ]] || { echo "circadian: warmth is a temperature in kelvin" >&2; return 1; }
+      ((value < MIN_WARMTH)) && value=$MIN_WARMTH
+      ((value > MAX_WARMTH)) && value=$MAX_WARMTH
+      cfg_set warmth "$value"
+      [[ $(observed_nightshift) == on ]] && set_temp "$value"
+      ;;
+    *)
+      echo "circadian: unknown setting '$key'" >&2
+      return 1
+      ;;
+  esac
+}
+
+# Tell a running Circadian widget to refresh after a change from the CLI.
+notify_shell() {
+  [[ ${CIRCADIAN_FROM_SHELL:-} == 1 ]] && return 0
+  omarchy-shell -q circadian refresh >/dev/null 2>&1 &
+}
+
+# --- output -----------------------------------------------------------------
+
+status_json() {
+  local theme light dark temp
+  theme=$(current_theme)
+  light=$(cfg lightTheme)
+  dark=$(cfg darkTheme)
+  temp=$(current_temp) || temp=""
+  load_sun_times
+  next_event_after "$(now)"
+
+  jq -cn \
+    --arg appearance "$(observed_appearance)" \
+    --arg theme "$theme" --arg themeName "$(theme_label "$theme")" \
+    --arg lightTheme "$light" --arg lightThemeName "$(theme_label "$light")" \
+    --arg darkTheme "$dark" --arg darkThemeName "$(theme_label "$dark")" \
+    --argjson darkAtNight "$(scheduled appearance && echo true || echo false)" \
+    --argjson nightShiftAtNight "$(scheduled nightshift && echo true || echo false)" \
+    --argjson appearanceOverride "$(has_override appearance && echo true || echo false)" \
+    --argjson nightShiftOverride "$(has_override nightshift && echo true || echo false)" \
+    --argjson nightShift "$([[ $(observed_nightshift) == on ]] && echo true || echo false)" \
+    --arg temperature "$temp" --argjson warmth "$(warmth)" \
+    --argjson minWarmth "$MIN_WARMTH" --argjson maxWarmth "$MAX_WARMTH" \
+    --argjson night "$([[ $EVENT_NAME == sunrise ]] && echo true || echo false)" \
+    --arg nextEvent "$EVENT_NAME" --arg nextEventAt "$(date -d "@$EVENT_AT" +%H:%M)" \
+    --arg sunrise "$SUNRISE" --arg sunset "$SUNSET" --arg sunSource "$SUN_SOURCE" \
+    '{appearance:$appearance, theme:$theme, themeName:$themeName,
+      lightTheme:$lightTheme, lightThemeName:$lightThemeName,
+      darkTheme:$darkTheme, darkThemeName:$darkThemeName,
+      darkAtNight:$darkAtNight, nightShiftAtNight:$nightShiftAtNight,
+      appearanceOverride:$appearanceOverride, nightShiftOverride:$nightShiftOverride,
+      nightShift:$nightShift, temperature:(($temperature|tonumber?) // null),
+      warmth:$warmth, minWarmth:$minWarmth, maxWarmth:$maxWarmth,
+      night:$night, nextEvent:$nextEvent, nextEventAt:$nextEventAt,
+      sunrise:$sunrise, sunset:$sunset, sunSource:$sunSource}'
+}
+
+status_text() {
+  local s
+  s=$(status_json)
+  jq -r '
+    def cap: (.[:1] | ascii_upcase) + .[1:];
+    (if .night then "Night" else "Day" end) + ", " + .nextEvent + " at " + .nextEventAt
+      + (if .sunSource == "fallback" then " (estimated)" else "" end) + ".",
+    "Appearance: " + (if .appearance == "other" then "another theme (" + .themeName + ")" else (.appearance | cap) + " (" + .themeName + ")" end)
+      + (if .darkAtNight then ", follows the sun" + (if .appearanceOverride then ", held until " + .nextEvent else "" end) else "" end) + ".",
+    "Night Shift: " + (if .nightShift then "on, " + (.warmth|tostring) + "K" else "off" end)
+      + (if .nightShiftAtNight then ", follows the sun" + (if .nightShiftOverride then ", held until " + .nextEvent else "" end) else "" end) + ".",
+    "Themes: " + (if .lightTheme == "" then "none" else .lightThemeName end) + " by day, "
+      + (if .darkTheme == "" then "none" else .darkThemeName end) + " by night."
+  ' <<<"$s"
+}
+
+themes_json() {
+  local slug mode
+  while IFS= read -r slug; do
+    [[ -n $slug ]] || continue
+    mode=$(theme_mode "$slug") || mode=dark
+    jq -cn --arg id "$slug" --arg name "$(theme_label "$slug")" --arg mode "$mode" '{id:$id, name:$name, mode:$mode}'
+  done < <(
+    {
+      find "$HOME/.config/omarchy/themes/" -mindepth 1 -maxdepth 1 \( -type d -o -type l \) -printf '%f\n' 2>/dev/null
+      find "${OMARCHY_PATH:-/usr/share/omarchy}/themes/" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null
+    } | sort -u
+  ) | jq -sc .
+}
+
+# --- commands ---------------------------------------------------------------
+
+case ${1:-status} in
+  appearance) set_feature appearance "${2:-toggle}" && notify_shell ;;
+  nightshift | night-shift) set_feature nightshift "${2:-toggle}" && notify_shell ;;
+  set) set_option "${2:-}" "${3:-}" && notify_shell ;;
+  apply)
+    apply
+    if [[ ${2:-} == --json ]]; then status_json; fi
+    ;;
+  status) if [[ ${2:-} == --json ]]; then status_json; else status_text; fi ;;
+  themes) themes_json ;;
+  -h | --help) sed -n '2,23p' "$SELF" | sed 's/^# \{0,1\}//' ;;
+  *)
+    echo "Usage: circadian [appearance|nightshift|set|apply|status|themes] ... (circadian --help)" >&2
+    exit 1
+    ;;
+esac

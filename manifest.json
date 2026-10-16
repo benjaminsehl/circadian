@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.benjaminsehl.circadian",
+  "name": "Circadian",
+  "version": "0.1.0",
+  "author": "Benjamin Sehl",
+  "license": "MIT",
+  "homepage": "https://github.com/benjaminsehl/circadian",
+  "repository": "https://github.com/benjaminsehl/circadian",
+  "description": "Your desktop follows the day: a light and a dark theme, and Night Shift, switched at sunrise and sunset.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Circadian",
+    "description": "Light/dark appearance and Night Shift, following sunrise and sunset",
+    "category": "Status",
+    "allowMultiple": false,
+    "defaultSection": "center"
+  }
+}
